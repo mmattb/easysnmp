@@ -1187,8 +1187,12 @@ static int __add_var_val_str(netsnmp_pdu *pdu, oid *name, int name_length,
     return ret;
 }
 
-/* takes ss and pdu as input and updates the 'response' argument */
-/* the input 'pdu' argument will be freed */
+/*
+ * Takes ss and pdu as input and updates the 'response' argument
+ * The input 'pdu' argument will be freed
+ * Sets Py errors for all cases when the return value is not STAT_SUCCESS.
+ *   If you spot a case where that is not true; file an issue.
+ */
 static int __send_sync_pdu(netsnmp_session *ss, netsnmp_pdu *pdu,
                            netsnmp_pdu **response, int retry_nosuch,
                            char *err_str, int *err_num, int *err_ind,
@@ -1214,16 +1218,17 @@ static int __send_sync_pdu(netsnmp_session *ss, netsnmp_pdu *pdu,
         *err_ind = SNMPERR_BAD_SESSION;
         status = SNMPERR_BAD_SESSION;
         strlcpy(err_str, snmp_api_errstring(*err_ind), STR_BUF_SIZE);
+        PyErr_SetString(EasySNMPError, err_str);
         goto done;
     }
 
 retry:
 
     Py_BEGIN_ALLOW_THREADS
-        status = snmp_sess_synch_response(ss, pdu, response);
+    status = snmp_sess_synch_response(ss, pdu, response);
     Py_END_ALLOW_THREADS
 
-        if ((*response == NULL) && (status == STAT_SUCCESS))
+    if ((*response == NULL) && (status == STAT_SUCCESS))
     {
         status = STAT_ERROR;
     }
@@ -1235,6 +1240,7 @@ retry:
         switch (status)
         {
         case SNMP_ERR_NOERROR:
+            status = STAT_SUCCESS;
             break;
 
         case SNMP_ERR_NOSUCHNAME:
@@ -1369,6 +1375,8 @@ retry:
         strcat(err_str, "send_sync_pdu: unknown status");
         *err_num = ss->s_snmp_errno;
         py_log_msg(DEBUG, "sync PDU: %s", err_str);
+
+        PyErr_SetString(EasySNMPError, err_str);
 
         break;
     }
@@ -1970,14 +1978,12 @@ static PyObject *netsnmp_get(PyObject *self, PyObject *args)
     int err_num;
     char *tmpstr = NULL;
     Py_ssize_t tmplen;
-    int error = 0;
     unsigned long snmp_version = 0;
 
     if (!args)
     {
         const char *err_msg = "netsnmp_get: missing arguments";
         PyErr_SetString(PyExc_ValueError, err_msg);
-        error = 1;
         goto done;
     }
 
@@ -2032,7 +2038,6 @@ static PyObject *netsnmp_get(PyObject *self, PyObject *args)
     {
         const char *err_msg = "unexpected error: varlist == null";
         PyErr_SetString(PyExc_RuntimeError, err_msg);
-        error = 1;
         goto done;
     }
 
@@ -2061,7 +2066,6 @@ static PyObject *netsnmp_get(PyObject *self, PyObject *args)
             PyErr_Format(EasySNMPUnknownObjectIDError,
                          "unknown object id (%s)",
                          (tag ? tag : "<null>"));
-            error = 1;
             snmp_free_pdu(pdu);
             Py_DECREF(varbind);
             Py_DECREF(varlist_iter);
@@ -2082,7 +2086,6 @@ static PyObject *netsnmp_get(PyObject *self, PyObject *args)
 
     if (PyErr_Occurred())
     {
-        error = 1;
         snmp_free_pdu(pdu);
         goto done;
     }
@@ -2096,9 +2099,8 @@ static PyObject *netsnmp_get(PyObject *self, PyObject *args)
                              &err_num, &err_ind, invalid_oids);
 
     __py_netsnmp_update_session_errors(session, err_str, err_num, err_ind);
-    if (status != 0)
+    if (status != STAT_SUCCESS)
     {
-        error = 1;
         goto done;
     }
 
@@ -2277,7 +2279,7 @@ done:
         response = NULL;
     }
 
-    if (error)
+    if (PyErr_Occurred())
     {
         return NULL;
     }
@@ -2324,7 +2326,6 @@ static PyObject *netsnmp_getnext(PyObject *self, PyObject *args)
     char err_str[STR_BUF_SIZE];
     char *tmpstr;
     Py_ssize_t tmplen;
-    int error = 0;
     unsigned long snmp_version = 0;
 
     BITARRAY_DECLARE(snmpv1_invalid_oids, DEFAULT_NUM_BAD_OIDS);
@@ -2411,7 +2412,6 @@ static PyObject *netsnmp_getnext(PyObject *self, PyObject *args)
                     PyErr_Format(EasySNMPUnknownObjectIDError,
                                  "unknown object id (%s)",
                                  (tag ? tag : "<null>"));
-                    error = 1;
                     snmp_free_pdu(pdu);
                     Py_DECREF(varbind);
                     Py_DECREF(varlist_iter);
@@ -2431,7 +2431,6 @@ static PyObject *netsnmp_getnext(PyObject *self, PyObject *args)
 
             if (PyErr_Occurred())
             {
-                error = 1;
                 snmp_free_pdu(pdu);
                 goto done;
             }
@@ -2444,7 +2443,6 @@ static PyObject *netsnmp_getnext(PyObject *self, PyObject *args)
 
             if (!invalid_oids)
             {
-                error = 1;
                 snmp_free_pdu(pdu);
                 const char *err_msg = "failed to call bitarray_calloc";
                 PyErr_SetString(PyExc_RuntimeError, err_msg);
@@ -2456,9 +2454,8 @@ static PyObject *netsnmp_getnext(PyObject *self, PyObject *args)
                                  &err_num, &err_ind, invalid_oids);
 
         __py_netsnmp_update_session_errors(session, err_str, err_num, err_ind);
-        if (status != 0)
+        if (status != STAT_SUCCESS)
         {
-            error = 1;
             goto done;
         }
 
@@ -2627,7 +2624,7 @@ done:
         snmp_free_pdu(response);
         response = NULL;
     }
-    if (error)
+    if (PyErr_Occurred())
     {
         return NULL;
     }
@@ -2686,7 +2683,6 @@ static PyObject *netsnmp_walk(PyObject *self, PyObject *args)
     int notdone = 1;
     char *tmpstr;
     Py_ssize_t tmplen;
-    int error = 0;
     bitarray *invalid_oids = NULL;
 
     if (args)
@@ -2801,7 +2797,6 @@ static PyObject *netsnmp_walk(PyObject *self, PyObject *args)
                 PyErr_Format(EasySNMPUnknownObjectIDError,
                              "unknown object id (%s)",
                              (tag ? tag : "<null>"));
-                error = 1;
                 snmp_free_pdu(pdu);
                 pdu = NULL;
                 Py_DECREF(varlist_iter);
@@ -2823,7 +2818,6 @@ static PyObject *netsnmp_walk(PyObject *self, PyObject *args)
 
         if (PyErr_Occurred())
         {
-            error = 1;
             snmp_free_pdu(pdu);
             pdu = NULL;
             goto done;
@@ -2868,7 +2862,6 @@ static PyObject *netsnmp_walk(PyObject *self, PyObject *args)
 
         if (PyErr_Occurred())
         {
-            error = 1;
             snmp_free_pdu(pdu);
             pdu = NULL;
             goto done;
@@ -2892,9 +2885,8 @@ static PyObject *netsnmp_walk(PyObject *self, PyObject *args)
                                      err_str, &err_num, &err_ind, invalid_oids);
             __py_netsnmp_update_session_errors(session, err_str, err_num,
                                                err_ind);
-            if (status != 0)
+            if (status != STAT_SUCCESS)
             {
-                error = 1;
                 /*
                  * pdu is released in __send_sync_pdu if an error occurs during
                  * the snmp_sess_synch_response function. It does not, however,
@@ -2906,6 +2898,7 @@ static PyObject *netsnmp_walk(PyObject *self, PyObject *args)
                     snmp_free_pdu(response);
                     response = NULL;
                 }
+
                 goto done;
             }
 
@@ -3046,7 +3039,7 @@ static PyObject *netsnmp_walk(PyObject *self, PyObject *args)
 
         if (PyErr_Occurred())
         {
-            error = 1;
+            goto done;
         }
     }
 
@@ -3073,7 +3066,7 @@ done:
         snmp_free_pdu(pdu);
         response = NULL;
     }
-    if (error)
+    if (PyErr_Occurred())
     {
         return NULL;
     }
@@ -3123,7 +3116,6 @@ static PyObject *netsnmp_getbulk(PyObject *self, PyObject *args)
     char err_str[STR_BUF_SIZE];
     char *tmpstr;
     Py_ssize_t tmplen;
-    int error = 0;
 
     oid_arr = calloc(MAX_OID_LEN, sizeof(oid));
 
@@ -3204,7 +3196,6 @@ static PyObject *netsnmp_getbulk(PyObject *self, PyObject *args)
                     PyErr_Format(EasySNMPUnknownObjectIDError,
                                  "unknown object id (%s)",
                                  (tag ? tag : "<null>"));
-                    error = 1;
                     snmp_free_pdu(pdu);
                     Py_DECREF(varbind);
                     Py_DECREF(varbinds_iter);
@@ -3224,7 +3215,6 @@ static PyObject *netsnmp_getbulk(PyObject *self, PyObject *args)
 
             if (PyErr_Occurred())
             {
-                error = 1;
                 snmp_free_pdu(pdu);
                 pdu = NULL;
                 goto done;
@@ -3234,9 +3224,8 @@ static PyObject *netsnmp_getbulk(PyObject *self, PyObject *args)
                                      err_str, &err_num, &err_ind, NULL);
             __py_netsnmp_update_session_errors(session, err_str, err_num,
                                                err_ind);
-            if (status != 0)
+            if (status != STAT_SUCCESS)
             {
-                error = 1;
                 if (response)
                 {
                     snmp_free_pdu(response);
@@ -3285,7 +3274,6 @@ static PyObject *netsnmp_getbulk(PyObject *self, PyObject *args)
 
                 if (PyErr_Occurred())
                 {
-                    error = 1;
                     snmp_free_pdu(pdu);
                     pdu = NULL;
                     if (response)
@@ -3386,7 +3374,7 @@ static PyObject *netsnmp_getbulk(PyObject *self, PyObject *args)
 
         if (PyErr_Occurred())
         {
-            error = 1;
+            goto done;
         }
     }
 
@@ -3395,7 +3383,7 @@ done:
     Py_XDECREF(sess_ptr);
     Py_XDECREF(err_bytes);
     SAFE_FREE(oid_arr);
-    if (error)
+    if (PyErr_Occurred())
     {
         return NULL;
     }
@@ -3448,7 +3436,6 @@ static PyObject *netsnmp_bulkwalk(PyObject *self, PyObject *args)
     int notdone = 1;
     char *tmpstr = NULL;
     Py_ssize_t tmplen;
-    int error = 0;
     int nonrepeaters;
     int maxrepetitions;
 
@@ -3574,7 +3561,6 @@ static PyObject *netsnmp_bulkwalk(PyObject *self, PyObject *args)
                 PyErr_Format(EasySNMPUnknownObjectIDError,
                              "unknown object id (%s)",
                              (oid_str_arr[varlist_ind] ? oid_str_arr[varlist_ind] : "<null>"));
-                error = 1;
                 Py_DECREF(varbind);
                 Py_DECREF(varlist_iter);
                 Py_XDECREF(tag_bytes);
@@ -3594,7 +3580,6 @@ static PyObject *netsnmp_bulkwalk(PyObject *self, PyObject *args)
 
         if (PyErr_Occurred())
         {
-            error = 1;
             goto done;
         }
 
@@ -3636,7 +3621,6 @@ static PyObject *netsnmp_bulkwalk(PyObject *self, PyObject *args)
 
         if (PyErr_Occurred())
         {
-            error = 1;
             goto done;
         }
 
@@ -3657,9 +3641,8 @@ static PyObject *netsnmp_bulkwalk(PyObject *self, PyObject *args)
 
                 __py_netsnmp_update_session_errors(session, err_str, err_num,
                                                    err_ind);
-                if (status != 0)
+                if (status != STAT_SUCCESS)
                 {
-                    error = 1;
                     if (response)
                     {
                         snmp_free_pdu(response);
@@ -3825,7 +3808,7 @@ static PyObject *netsnmp_bulkwalk(PyObject *self, PyObject *args)
 
         if (PyErr_Occurred())
         {
-            error = 1;
+            goto done;
         }
     }
 
@@ -3847,7 +3830,7 @@ done:
     SAFE_FREE(oid_idx_str_arr);
     py_log_msg(DEBUG, "netsnmp_bulkwalk: End cleanup");
 
-    if (error)
+    if (PyErr_Occurred())
     {
         return NULL;
     }
@@ -3889,7 +3872,6 @@ static PyObject *netsnmp_set(PyObject *self, PyObject *args)
     char err_str[STR_BUF_SIZE];
     char *tmpstr = NULL;
     Py_ssize_t tmplen;
-    int error = 0;
 
     if (oid_arr && args)
     {
@@ -3942,7 +3924,6 @@ static PyObject *netsnmp_set(PyObject *self, PyObject *args)
                     PyErr_Format(EasySNMPUnknownObjectIDError,
                                  "unknown object id (%s)",
                                  (tag ? tag : "<null>"));
-                    error = 1;
                     snmp_free_pdu(pdu);
                     pdu = NULL;
                     Py_DECREF(varbind);
@@ -3964,7 +3945,6 @@ static PyObject *netsnmp_set(PyObject *self, PyObject *args)
                         PyErr_SetString(EasySNMPUndeterminedTypeError,
                                         "a type could not be determine for "
                                         "the object");
-                        error = 1;
                         snmp_free_pdu(pdu);
                         pdu = NULL;
                         Py_DECREF(varbind);
@@ -3980,7 +3960,6 @@ static PyObject *netsnmp_set(PyObject *self, PyObject *args)
                         PyErr_SetString(EasySNMPUndeterminedTypeError,
                                         "a type could not be determine for "
                                         "the object");
-                        error = 1;
                         snmp_free_pdu(pdu);
                         pdu = NULL;
                         Py_DECREF(varbind);
@@ -4044,7 +4023,6 @@ static PyObject *netsnmp_set(PyObject *self, PyObject *args)
             Py_DECREF(varlist_iter);
             if (PyErr_Occurred())
             {
-                error = 1;
                 snmp_free_pdu(pdu);
                 pdu = NULL;
                 goto done;
@@ -4061,27 +4039,19 @@ static PyObject *netsnmp_set(PyObject *self, PyObject *args)
             response = NULL;
         }
 
-        if (status != 0)
+        if (status != STAT_SUCCESS)
         {
-            error = 1;
             goto done;
         }
 
-        if (status == STAT_SUCCESS)
-        {
-            ret = Py_BuildValue("i", 1); /* success, return True */
-        }
-        else
-        {
-            ret = Py_BuildValue("i", 0); /* fail, return False */
-        }
+        ret = Py_BuildValue("i", 1); /* success, return True */
     }
 
 done:
     Py_XDECREF(sess_ptr);
     Py_XDECREF(err_bytes);
     SAFE_FREE(oid_arr);
-    if (error)
+    if (PyErr_Occurred())
     {
         return NULL;
     }
